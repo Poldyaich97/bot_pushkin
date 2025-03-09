@@ -1,0 +1,6 @@
+# Игнорировать каждый файл, кроме bot.py
+apartments_backup.db
+apartments.db
+log
+nohup.out
+.env 
