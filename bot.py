@@ -169,6 +169,35 @@ def resolve_user_identifier(identifier: str) -> Optional[int]:
     return None
 
 
+async def resolve_user(identifier: str, context: CallbackContext) -> Optional[int]:
+    """Асинхронно пытается найти user_id по локальной базе, username или ссылке."""
+    user_id = resolve_user_identifier(identifier)
+    if user_id is not None:
+        return user_id
+
+    normalized = identifier.strip()
+    if not normalized:
+        return None
+
+    if normalized.startswith('@'):
+        handle = normalized
+    else:
+        handle = f"@{normalized}"
+
+    try:
+        chat = await context.bot.get_chat(handle)
+    except Exception as error:
+        logger.warning(f"Failed to resolve user via get_chat for {identifier}: {error}")
+        return None
+
+    if chat.type != "private":
+        logger.warning(f"Resolved chat {chat.id} is not private, skipping")
+        return None
+
+    remember_user(chat)
+    return chat.id
+
+
 def clear_pending_requests_from_db() -> int:
     """Удаляет все ожидающие запросы на подтверждение и возвращает их количество."""
     with get_db_connection() as conn:
@@ -601,7 +630,6 @@ async def delete_apartment(update: Update, context: CallbackContext) -> None:
 async def admin_unlink(update: Update, context: CallbackContext) -> None:
     """Удаление привязки пользователя администратором."""
     remember_user(update.message.from_user)
-    remember_user(update.message.from_user)
     actor_id = update.message.from_user.id
     if not is_admin_user(actor_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -614,7 +642,7 @@ async def admin_unlink(update: Update, context: CallbackContext) -> None:
         )
         return
 
-    target_user_id = resolve_user_identifier(context.args[0])
+    target_user_id = await resolve_user(context.args[0], context)
     if target_user_id is None:
         await update.message.reply_text(
             "Не удалось определить пользователя. Укажите ID, @username или скопированную ссылку tg://user?id=..."
@@ -883,7 +911,7 @@ async def admin_assign(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Номер квартиры должен быть числом.")
         return
 
-    target_user_id = resolve_user_identifier(context.args[1])
+    target_user_id = await resolve_user(context.args[1], context)
     if target_user_id is None:
         await update.message.reply_text(
             "Не удалось определить пользователя. Укажите ID, @username или ссылку tg://user?id=..."
@@ -1051,7 +1079,7 @@ async def add_admin(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Укажите ID пользователя или его @username.")
         return
 
-    new_admin_id = resolve_user_identifier(context.args[0])
+    new_admin_id = await resolve_user(context.args[0], context)
     if new_admin_id is None:
         await update.message.reply_text(
             "Не удалось определить пользователя. Укажите ID, @username или ссылку tg://user?id=..."
@@ -1087,7 +1115,7 @@ async def remove_admin(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Укажите ID пользователя или его @username.")
         return
 
-    admin_id = resolve_user_identifier(context.args[0])
+    admin_id = await resolve_user(context.args[0], context)
     if admin_id is None:
         await update.message.reply_text(
             "Не удалось определить пользователя. Укажите ID, @username или ссылку tg://user?id=..."
