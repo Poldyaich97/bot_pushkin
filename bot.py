@@ -1,7 +1,9 @@
 import os
 import logging
 import sqlite3
+import re
 from datetime import datetime, time
+from typing import Optional
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -34,6 +36,7 @@ MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID'))
 GROUP_ID = int(os.getenv('GROUP_ID'))
 FORCE_REGISTRATION_CODE = "2512"
 BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Moscow')
+USER_LINK_RE = re.compile(r'tg://user\?id=(\d+)', re.IGNORECASE)
 
 try:
     BOT_TZINFO = ZoneInfo(BOT_TIMEZONE)
@@ -94,6 +97,78 @@ def is_valid_apartment(apartment_number: int) -> bool:
            (HOUSE2_START <= apartment_number <= HOUSE2_END)
 
 
+def upsert_user_profile(user) -> None:
+    """Сохраняет известную информацию о пользователе."""
+    if not user:
+        return
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            INSERT INTO user_profiles (user_id, username, first_name, last_name, last_seen)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                last_seen=excluded.last_seen
+            """,
+            (
+                user.id,
+                user.username.lower() if user.username else None,
+                user.first_name,
+                user.last_name,
+                datetime.utcnow().isoformat(),
+            )
+        )
+        conn.commit()
+
+
+def remember_user(user) -> None:
+    """Оборачивает сохранение профиля с безопасной проверкой."""
+    try:
+        upsert_user_profile(user)
+    except Exception as error:
+        logger.warning(f"Failed to update user profile for {getattr(user, 'id', 'unknown')}: {error}")
+
+
+def resolve_user_identifier(identifier: str) -> Optional[int]:
+    """Преобразует ID, @username или tg-ссылку в числовой user_id."""
+    if not identifier:
+        return None
+
+    normalized = identifier.strip()
+
+    match = USER_LINK_RE.search(normalized)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    if normalized.startswith('@'):
+        normalized = normalized[1:]
+
+    if normalized.lstrip('-').isdigit():
+        try:
+            return int(normalized)
+        except ValueError:
+            return None
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id FROM user_profiles WHERE username = ?",
+            (normalized.lower(),)
+        )
+        row = cursor.fetchone()
+        if row:
+            return row[0]
+
+    return None
+
+
 def clear_pending_requests_from_db() -> int:
     """Удаляет все ожидающие запросы на подтверждение и возвращает их количество."""
     with get_db_connection() as conn:
@@ -131,6 +206,15 @@ def create_db():
             added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
         
+        cursor.execute('''CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            last_seen TIMESTAMP
+        )''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_user_profiles_username ON user_profiles(username)')
+        
         # Таблица запросов на подтверждение
         cursor.execute('''CREATE TABLE IF NOT EXISTS approval_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,6 +235,7 @@ async def start(update: Update, context: CallbackContext) -> None:
     try:
         user_id = update.message.from_user.id
         chat_id = update.message.chat.id
+        remember_user(update.message.from_user)
         
         if chat_id != GROUP_ID:
             await update.message.reply_text(
@@ -185,6 +270,7 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
         return
 
     user_id = update.message.from_user.id
+    remember_user(update.message.from_user)
     user_mention = format_user_mention(update.message.from_user)
     
     # Пропускаем сообщения от администраторов
@@ -222,6 +308,7 @@ async def request_apartment_access(update: Update, context: CallbackContext) -> 
     apartment_number = int(context.args[0])
     requesting_user = update.message.from_user
     requesting_user_id = requesting_user.id
+    remember_user(requesting_user)
     
     # Безопасное форматирование имени пользователя
     if requesting_user.username:
@@ -257,6 +344,7 @@ async def request_apartment_access(update: Update, context: CallbackContext) -> 
             
             try:
                 existing_user = await context.bot.get_chat_member(GROUP_ID, existing_user_id)
+                remember_user(existing_user.user)
                 if existing_user.user.username:
                     existing_user_mention = f"@{existing_user.user.username}"
                 else:
@@ -298,6 +386,7 @@ async def approve_request(update: Update, context: CallbackContext) -> None:
             await update.message.reply_text("Укажите ID пользователя.")
             return
 
+        remember_user(update.message.from_user)
         approver_id = update.message.from_user.id
         requesting_user_id = int(context.args[0])
 
@@ -359,6 +448,7 @@ async def approve_request(update: Update, context: CallbackContext) -> None:
             # Отправляем уведомление
             try:
                 requesting_user = await context.bot.get_chat_member(GROUP_ID, requesting_user_id)
+                remember_user(requesting_user.user)
                 if requesting_user.user.username:
                     user_mention = f"@{requesting_user.user.username}"
                 else:
@@ -389,6 +479,7 @@ async def reject_request(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Укажите ID пользователя.")
         return
 
+    remember_user(update.message.from_user)
     approver_id = update.message.from_user.id
     requesting_user_id = int(context.args[0])
 
@@ -412,6 +503,7 @@ async def reject_request(update: Update, context: CallbackContext) -> None:
 
             try:
                 requesting_user = await context.bot.get_chat_member(GROUP_ID, requesting_user_id)
+                remember_user(requesting_user.user)
                 if requesting_user.user.username:
                     user_mention = f"@{requesting_user.user.username}"
                 else:
@@ -431,6 +523,7 @@ async def reject_request(update: Update, context: CallbackContext) -> None:
 
 async def force_registration(update: Update, context: CallbackContext) -> None:
     """Очистка базы и запрос регистрации у всех участников"""
+    remember_user(update.message.from_user)
     user_id = update.message.from_user.id
     if user_id != MAIN_ADMIN_ID:
         await update.message.reply_text("Эта команда доступна только главному администратору.")
@@ -482,6 +575,7 @@ async def force_registration(update: Update, context: CallbackContext) -> None:
 
 async def delete_apartment(update: Update, context: CallbackContext) -> None:
     """Удаление привязки к квартире"""
+    remember_user(update.message.from_user)
     user_id = update.message.from_user.id
     user = update.message.from_user
     user_mention = format_user_mention(user)
@@ -506,6 +600,8 @@ async def delete_apartment(update: Update, context: CallbackContext) -> None:
 
 async def admin_unlink(update: Update, context: CallbackContext) -> None:
     """Удаление привязки пользователя администратором."""
+    remember_user(update.message.from_user)
+    remember_user(update.message.from_user)
     actor_id = update.message.from_user.id
     if not is_admin_user(actor_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -518,10 +614,11 @@ async def admin_unlink(update: Update, context: CallbackContext) -> None:
         )
         return
 
-    try:
-        target_user_id = int(context.args[0])
-    except ValueError:
-        await update.message.reply_text("Первым параметром укажите числовой ID пользователя.")
+    target_user_id = resolve_user_identifier(context.args[0])
+    if target_user_id is None:
+        await update.message.reply_text(
+            "Не удалось определить пользователя. Укажите ID, @username или скопированную ссылку tg://user?id=..."
+        )
         return
 
     apartment_number = None
@@ -573,6 +670,7 @@ async def admin_unlink(update: Update, context: CallbackContext) -> None:
 
     try:
         chat_member = await context.bot.get_chat_member(GROUP_ID, target_user_id)
+        remember_user(chat_member.user)
         target_mention = format_user_mention(chat_member.user)
     except Exception as error:
         logger.warning(f"Failed to load chat member {target_user_id} for admin unlink: {error}")
@@ -596,6 +694,7 @@ async def admin_unlink(update: Update, context: CallbackContext) -> None:
 
 async def admin_delete_apartment(update: Update, context: CallbackContext) -> None:
     """Удаление записи о квартире по номеру."""
+    remember_user(update.message.from_user)
     actor_id = update.message.from_user.id
     if not is_admin_user(actor_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -641,6 +740,7 @@ async def admin_delete_apartment(update: Update, context: CallbackContext) -> No
     for resident_id in residents:
         try:
             member = await context.bot.get_chat_member(GROUP_ID, resident_id)
+            remember_user(member.user)
             resident_mentions.append(format_user_mention(member.user))
         except Exception as error:
             logger.warning(f"Failed to load resident {resident_id} for admindelete: {error}")
@@ -666,6 +766,7 @@ async def admin_delete_apartment(update: Update, context: CallbackContext) -> No
 
 async def clear_approval_requests(update: Update, context: CallbackContext) -> None:
     """Очистка всех ожидающих запросов на подтверждение квартир."""
+    remember_user(update.message.from_user)
     actor_id = update.message.from_user.id
     if not is_admin_user(actor_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -680,6 +781,7 @@ async def clear_approval_requests(update: Update, context: CallbackContext) -> N
 
 async def apartment_stats(update: Update, context: CallbackContext) -> None:
     """Вывод количества занятых и свободных квартир."""
+    remember_user(update.message.from_user)
     actor_id = update.message.from_user.id
     if not is_admin_user(actor_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -724,6 +826,7 @@ async def handle_admin_callback(update: Update, context: CallbackContext) -> Non
 
     data = query.data
     actor_id = query.from_user.id
+    remember_user(query.from_user)
 
     if data == "admin_clear_requests":
         if not is_admin_user(actor_id):
@@ -780,10 +883,11 @@ async def admin_assign(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Номер квартиры должен быть числом.")
         return
 
-    try:
-        target_user_id = int(context.args[1])
-    except ValueError:
-        await update.message.reply_text("ID пользователя должен быть числом.")
+    target_user_id = resolve_user_identifier(context.args[1])
+    if target_user_id is None:
+        await update.message.reply_text(
+            "Не удалось определить пользователя. Укажите ID, @username или ссылку tg://user?id=..."
+        )
         return
 
     if not is_valid_apartment(apartment_number):
@@ -838,6 +942,7 @@ async def admin_assign(update: Update, context: CallbackContext) -> None:
 
     try:
         new_resident = await context.bot.get_chat_member(GROUP_ID, target_user_id)
+        remember_user(new_resident.user)
         target_mention = format_user_mention(new_resident.user)
     except Exception as error:
         logger.warning(f"Failed to load chat member {target_user_id} for admin assign: {error}")
@@ -865,6 +970,7 @@ async def admin_assign(update: Update, context: CallbackContext) -> None:
 
 async def view_apartments(update: Update, context: CallbackContext) -> None:
     """Просмотр списка квартир и их жильцов"""
+    remember_user(update.message.from_user)
     user_id = update.message.from_user.id
     
     # Проверяем, является ли пользователь администратором
@@ -898,6 +1004,7 @@ async def view_apartments(update: Update, context: CallbackContext) -> None:
             
             try:
                 user = await context.bot.get_chat_member(GROUP_ID, user_id)
+                remember_user(user.user)
                 # Безопасное форматирование имени пользователя
                 if user.user.username:
                     user_info = f"@{user.user.username}"
@@ -935,15 +1042,21 @@ async def view_apartments(update: Update, context: CallbackContext) -> None:
 
 async def add_admin(update: Update, context: CallbackContext) -> None:
     """Добавление нового администратора"""
+    remember_user(update.message.from_user)
     if update.message.from_user.id != MAIN_ADMIN_ID:
         await update.message.reply_text("Эта команда доступна только главному администратору.")
         return
 
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Укажите ID пользователя.")
+    if not context.args:
+        await update.message.reply_text("Укажите ID пользователя или его @username.")
         return
 
-    new_admin_id = int(context.args[0])
+    new_admin_id = resolve_user_identifier(context.args[0])
+    if new_admin_id is None:
+        await update.message.reply_text(
+            "Не удалось определить пользователя. Укажите ID, @username или ссылку tg://user?id=..."
+        )
+        return
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -953,6 +1066,7 @@ async def add_admin(update: Update, context: CallbackContext) -> None:
 
     try:
         user = await context.bot.get_chat_member(GROUP_ID, new_admin_id)
+        remember_user(user.user)
         user_mention = format_user_mention(user.user)
         await update.message.reply_text(
             f"✅ {user_mention} добавлен как администратор",
@@ -964,15 +1078,21 @@ async def add_admin(update: Update, context: CallbackContext) -> None:
 
 async def remove_admin(update: Update, context: CallbackContext) -> None:
     """Удаление администратора"""
+    remember_user(update.message.from_user)
     if update.message.from_user.id != MAIN_ADMIN_ID:
         await update.message.reply_text("Эта команда доступна только главному администратору.")
         return
 
-    if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text("Укажите ID пользователя.")
+    if not context.args:
+        await update.message.reply_text("Укажите ID пользователя или его @username.")
         return
 
-    admin_id = int(context.args[0])
+    admin_id = resolve_user_identifier(context.args[0])
+    if admin_id is None:
+        await update.message.reply_text(
+            "Не удалось определить пользователя. Укажите ID, @username или ссылку tg://user?id=..."
+        )
+        return
 
     if admin_id == MAIN_ADMIN_ID:
         await update.message.reply_text("Невозможно удалить главного администратора.")
@@ -986,6 +1106,7 @@ async def remove_admin(update: Update, context: CallbackContext) -> None:
 
     try:
         user = await context.bot.get_chat_member(GROUP_ID, admin_id)
+        remember_user(user.user)
         user_mention = format_user_mention(user.user)
         await update.message.reply_text(
             f"❌ {user_mention} удален из администраторов",
@@ -998,6 +1119,7 @@ async def remove_admin(update: Update, context: CallbackContext) -> None:
 
 async def list_admins(update: Update, context: CallbackContext) -> None:
     """Вывод списка администраторов."""
+    remember_user(update.message.from_user)
     requester_id = update.message.from_user.id
     if not is_admin_user(requester_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
@@ -1022,6 +1144,7 @@ async def list_admins(update: Update, context: CallbackContext) -> None:
     for admin_id, added_by, added_date in admins:
         try:
             member = await context.bot.get_chat_member(GROUP_ID, admin_id)
+            remember_user(member.user)
             admin_mention = format_user_mention(member.user)
         except Exception as error:
             logger.warning(f"Failed to load admin {admin_id}: {error}")
@@ -1038,6 +1161,7 @@ async def list_admins(update: Update, context: CallbackContext) -> None:
 
 async def admin_help(update: Update, context: CallbackContext) -> None:
     """Подсказка по админским командам."""
+    remember_user(update.message.from_user)
     if not is_admin_user(update.message.from_user.id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
         return
@@ -1054,6 +1178,7 @@ async def admin_help(update: Update, context: CallbackContext) -> None:
         "/listadmins - Показать текущих администраторов\n"
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
         "/removeadmin [ID] - Удалить администратора (главный админ)\n"
+        "\nВместо ID можно указывать @username или ссылку tg://user?id=..."
     )
     await update.message.reply_text(admin_commands)
     await update.message.reply_text(
@@ -1063,6 +1188,7 @@ async def admin_help(update: Update, context: CallbackContext) -> None:
 
 async def help_command(update: Update, context: CallbackContext) -> None:
     """Показ списка доступных команд"""
+    remember_user(update.message.from_user)
     user_id = update.message.from_user.id
 
     is_admin = is_admin_user(user_id)
@@ -1088,6 +1214,7 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
         "/removeadmin [ID] - Удалить администратора (главный админ)\n"
         "/adminhelp - Подсказка по админским командам\n"
+        "Поддерживаются ID, @username и ссылки tg://user?id=..."
     )
 
     message = basic_commands + (admin_commands if is_admin else "")
@@ -1095,6 +1222,7 @@ async def help_command(update: Update, context: CallbackContext) -> None:
 
 async def check_all_members(update: Update, context: CallbackContext) -> None:
     """Проверка всех участников группы на наличие регистрации"""
+    remember_user(update.message.from_user)
     if update.message.from_user.id != MAIN_ADMIN_ID:
         await update.message.reply_text("Эта команда доступна только главному администратору.")
         return
