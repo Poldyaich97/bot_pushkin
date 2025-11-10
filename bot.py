@@ -27,6 +27,38 @@ HOUSE1_END = 252
 HOUSE2_START = 253
 HOUSE2_END = 403
 
+
+def sanitize_markdown(text: str) -> str:
+    """Удаление символов, конфликтующих с Markdown-разметкой."""
+    if not text:
+        return ""
+    return (
+        text.replace('[', '')
+        .replace(']', '')
+        .replace('(', '')
+        .replace(')', '')
+        .replace('_', '')
+        .replace('*', '')
+    )
+
+
+def format_user_mention(user) -> str:
+    """Формирование безопасного упоминания пользователя."""
+    if user.username:
+        return f"@{user.username}"
+    display_name = sanitize_markdown(user.first_name or "пользователь")
+    if not display_name:
+        display_name = "пользователь"
+    return f"[{display_name}](tg://user?id={user.id})"
+
+
+def is_admin_user(user_id: int) -> bool:
+    """Проверка наличия прав администратора."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+        return cursor.fetchone() is not None
+
 def get_db_connection():
     """Создание подключения к базе данных"""
     return sqlite3.connect('apartments.db')
@@ -111,7 +143,7 @@ async def handle_message(update: Update, context: CallbackContext) -> None:
         return
 
     user_id = update.message.from_user.id
-    user_mention = f"@{update.message.from_user.username}" if update.message.from_user.username else f"[{update.message.from_user.first_name}](tg://user?id={user_id})"
+    user_mention = format_user_mention(update.message.from_user)
     
     # Пропускаем сообщения от администраторов
     with get_db_connection() as conn:
@@ -150,7 +182,10 @@ async def request_apartment_access(update: Update, context: CallbackContext) -> 
     requesting_user_id = requesting_user.id
     
     # Безопасное форматирование имени пользователя
-    user_mention = f"@{requesting_user.username}" if requesting_user.username else requesting_user.first_name
+    if requesting_user.username:
+        user_mention = f"@{requesting_user.username}"
+    else:
+        user_mention = sanitize_markdown(requesting_user.first_name or "пользователь")
 
     if not is_valid_apartment(apartment_number):
         await update.message.reply_text(
@@ -180,7 +215,10 @@ async def request_apartment_access(update: Update, context: CallbackContext) -> 
             
             try:
                 existing_user = await context.bot.get_chat_member(GROUP_ID, existing_user_id)
-                existing_user_mention = f"@{existing_user.user.username}" if existing_user.user.username else existing_user.user.first_name
+                if existing_user.user.username:
+                    existing_user_mention = f"@{existing_user.user.username}"
+                else:
+                    existing_user_mention = sanitize_markdown(existing_user.user.first_name or "житель")
                 
                 notification_text = (
                     f"{user_mention} запросил доступ к квартире {apartment_number}.\n"
@@ -279,7 +317,10 @@ async def approve_request(update: Update, context: CallbackContext) -> None:
             # Отправляем уведомление
             try:
                 requesting_user = await context.bot.get_chat_member(GROUP_ID, requesting_user_id)
-                user_mention = f"@{requesting_user.user.username}" if requesting_user.user.username else requesting_user.user.first_name
+                if requesting_user.user.username:
+                    user_mention = f"@{requesting_user.user.username}"
+                else:
+                    user_mention = sanitize_markdown(requesting_user.user.first_name or "пользователь")
                 
                 success_message = f"✅ Пользователь {user_mention} получил доступ к квартире {apartment_number}"
                 
@@ -329,7 +370,10 @@ async def reject_request(update: Update, context: CallbackContext) -> None:
 
             try:
                 requesting_user = await context.bot.get_chat_member(GROUP_ID, requesting_user_id)
-                user_mention = f"@{requesting_user.user.username}" if requesting_user.user.username else requesting_user.user.first_name
+                if requesting_user.user.username:
+                    user_mention = f"@{requesting_user.user.username}"
+                else:
+                    user_mention = sanitize_markdown(requesting_user.user.first_name or "пользователь")
                 
                 reject_message = f"❌ Запрос от {user_mention} на доступ к квартире {apartment_number} отклонен"
                 
@@ -392,7 +436,7 @@ async def delete_apartment(update: Update, context: CallbackContext) -> None:
     """Удаление привязки к квартире"""
     user_id = update.message.from_user.id
     user = update.message.from_user
-    user_mention = f"@{user.username}" if user.username else f"[{user.first_name}](tg://user?id={user_id})"
+    user_mention = format_user_mention(user)
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -410,6 +454,200 @@ async def delete_apartment(update: Update, context: CallbackContext) -> None:
             )
         else:
             await update.message.reply_text("У вас нет привязанной квартиры.")
+
+
+async def admin_unlink(update: Update, context: CallbackContext) -> None:
+    """Удаление привязки пользователя администратором."""
+    actor_id = update.message.from_user.id
+    if not is_admin_user(actor_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /adminunlink [user_id] [номер_квартиры]\n"
+            "Если номер квартиры не указан, будут удалены все привязки пользователя."
+        )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Первым параметром укажите числовой ID пользователя.")
+        return
+
+    apartment_number = None
+    if len(context.args) > 1:
+        if not context.args[1].isdigit():
+            await update.message.reply_text("Номер квартиры должен быть числом.")
+            return
+        apartment_number = int(context.args[1])
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if apartment_number is not None:
+            cursor.execute(
+                """
+                SELECT apartment_number
+                FROM apartments
+                WHERE user_id = ? AND apartment_number = ?
+                """,
+                (target_user_id, apartment_number)
+            )
+        else:
+            cursor.execute(
+                """
+                SELECT apartment_number
+                FROM apartments
+                WHERE user_id = ?
+                """,
+                (target_user_id,)
+            )
+        apartments = cursor.fetchall()
+
+        if not apartments:
+            await update.message.reply_text("Для указанного пользователя привязки не найдены.")
+            return
+
+        if apartment_number is not None:
+            cursor.execute(
+                "DELETE FROM apartments WHERE user_id = ? AND apartment_number = ?",
+                (target_user_id, apartment_number)
+            )
+        else:
+            cursor.execute(
+                "DELETE FROM apartments WHERE user_id = ?",
+                (target_user_id,)
+            )
+        conn.commit()
+
+    removed_apartments = ", ".join(str(item[0]) for item in apartments)
+
+    try:
+        chat_member = await context.bot.get_chat_member(GROUP_ID, target_user_id)
+        target_mention = format_user_mention(chat_member.user)
+    except Exception as error:
+        logger.warning(f"Failed to load chat member {target_user_id} for admin unlink: {error}")
+        target_mention = f"ID: {target_user_id}"
+
+    confirmation_text = (
+        f"Привязка пользователя {target_mention} к квартире(ам) {removed_apartments} удалена."
+    )
+
+    await update.message.reply_text(confirmation_text, parse_mode='Markdown')
+
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=f"🗑 Администратор снял привязку {target_mention} с квартиры(квартир) {removed_apartments}",
+            parse_mode='Markdown'
+        )
+    except Exception as error:
+        logger.warning(f"Failed to notify group about admin unlink: {error}")
+
+
+async def admin_assign(update: Update, context: CallbackContext) -> None:
+    """Переназначение квартиры на указанного пользователя."""
+    actor_id = update.message.from_user.id
+    if not is_admin_user(actor_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /adminassign [номер_квартиры] [user_id]\n"
+            "Перед назначением текущие привязки квартиры и пользователя будут удалены."
+        )
+        return
+
+    try:
+        apartment_number = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Номер квартиры должен быть числом.")
+        return
+
+    try:
+        target_user_id = int(context.args[1])
+    except ValueError:
+        await update.message.reply_text("ID пользователя должен быть числом.")
+        return
+
+    if not is_valid_apartment(apartment_number):
+        await update.message.reply_text(
+            "Неверный номер квартиры.\n"
+            f"Дом 1: квартиры {HOUSE1_START}-{HOUSE1_END}\n"
+            f"Дом 2: квартиры от {HOUSE2_START}"
+        )
+        return
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute(
+            "SELECT user_id FROM apartments WHERE apartment_number = ?",
+            (apartment_number,)
+        )
+        previous_residents = [row[0] for row in cursor.fetchall()]
+
+        cursor.execute(
+            "SELECT apartment_number FROM apartments WHERE user_id = ?",
+            (target_user_id,)
+        )
+        previous_apartments = [row[0] for row in cursor.fetchall()]
+
+        cursor.execute(
+            "DELETE FROM apartments WHERE apartment_number = ?",
+            (apartment_number,)
+        )
+        cursor.execute(
+            "DELETE FROM apartments WHERE user_id = ?",
+            (target_user_id,)
+        )
+        cursor.execute(
+            """
+            INSERT INTO apartments (apartment_number, user_id)
+            VALUES (?, ?)
+            """,
+            (apartment_number, target_user_id)
+        )
+        cursor.execute(
+            """
+            UPDATE approval_requests
+            SET status = 'approved', approver_user_id = ?
+            WHERE apartment_number = ?
+              AND requesting_user_id = ?
+              AND status = 'pending'
+            """,
+            (actor_id, apartment_number, target_user_id)
+        )
+        conn.commit()
+
+    try:
+        new_resident = await context.bot.get_chat_member(GROUP_ID, target_user_id)
+        target_mention = format_user_mention(new_resident.user)
+    except Exception as error:
+        logger.warning(f"Failed to load chat member {target_user_id} for admin assign: {error}")
+        target_mention = f"ID: {target_user_id}"
+
+    removed_from_apartment = ", ".join(str(user_id) for user_id in previous_residents) if previous_residents else "нет"
+    removed_from_user = ", ".join(str(number) for number in previous_apartments) if previous_apartments else "нет"
+
+    response_lines = [
+        f"Пользователь {target_mention} назначен на квартиру {apartment_number}.",
+        f"С квартиры удалены прежние жильцы: {removed_from_apartment}.",
+        f"У пользователя удалены прежние квартиры: {removed_from_user}."
+    ]
+
+    await update.message.reply_text("\n".join(response_lines), parse_mode='Markdown')
+
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=f"🏠 Квартира {apartment_number} закреплена за {target_mention} администратором.",
+            parse_mode='Markdown'
+        )
+    except Exception as error:
+        logger.warning(f"Failed to notify group about admin assign: {error}")
 
 async def view_apartments(update: Update, context: CallbackContext) -> None:
     """Просмотр списка квартир и их жильцов"""
@@ -450,7 +688,7 @@ async def view_apartments(update: Update, context: CallbackContext) -> None:
                 if user.user.username:
                     user_info = f"@{user.user.username}"
                 else:
-                    user_info = user.user.first_name.replace('[', '').replace(']', '').replace('_', '').replace('*', '')
+                    user_info = sanitize_markdown(user.user.first_name or "пользователь")
             except Exception as e:
                 logger.error(f"Error getting user info for {user_id}: {e}")
                 user_info = f"ID: {user_id}"
@@ -501,7 +739,7 @@ async def add_admin(update: Update, context: CallbackContext) -> None:
 
     try:
         user = await context.bot.get_chat_member(GROUP_ID, new_admin_id)
-        user_mention = f"@{user.user.username}" if user.user.username else f"[{user.user.first_name}](tg://user?id={new_admin_id})"
+        user_mention = format_user_mention(user.user)
         await update.message.reply_text(
             f"✅ {user_mention} добавлен как администратор",
             parse_mode='Markdown'
@@ -534,7 +772,7 @@ async def remove_admin(update: Update, context: CallbackContext) -> None:
 
     try:
         user = await context.bot.get_chat_member(GROUP_ID, admin_id)
-        user_mention = f"@{user.user.username}" if user.user.username else f"[{user.user.first_name}](tg://user?id={admin_id})"
+        user_mention = format_user_mention(user.user)
         await update.message.reply_text(
             f"❌ {user_mention} удален из администраторов",
             parse_mode='Markdown'
@@ -543,15 +781,70 @@ async def remove_admin(update: Update, context: CallbackContext) -> None:
         logger.error(f"Error removing admin: {e}")
         await update.message.reply_text("Ошибка при удалении администратора.")
 
+
+async def list_admins(update: Update, context: CallbackContext) -> None:
+    """Вывод списка администраторов."""
+    requester_id = update.message.from_user.id
+    if not is_admin_user(requester_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT user_id, added_by, added_date
+            FROM admins
+            ORDER BY added_date
+            """
+        )
+        admins = cursor.fetchall()
+
+    if not admins:
+        await update.message.reply_text("Список администраторов пуст.")
+        return
+
+    lines = ["👑 Текущие администраторы:"]
+    for admin_id, added_by, added_date in admins:
+        try:
+            member = await context.bot.get_chat_member(GROUP_ID, admin_id)
+            admin_mention = format_user_mention(member.user)
+        except Exception as error:
+            logger.warning(f"Failed to load admin {admin_id}: {error}")
+            admin_mention = f"ID: {admin_id}"
+
+        suffix = " (главный администратор)" if admin_id == MAIN_ADMIN_ID else ""
+        added_info = f", добавлен {added_date}" if added_date else ""
+        if added_by:
+            added_info += f", добавил {added_by}"
+        lines.append(f"- {admin_mention}{suffix}{added_info}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode='Markdown')
+
+
+async def admin_help(update: Update, context: CallbackContext) -> None:
+    """Подсказка по админским командам."""
+    if not is_admin_user(update.message.from_user.id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    admin_commands = (
+        "👑 Команды администратора:\n"
+        "/viewapartments - Просмотр списка квартир\n"
+        "/forceregistration - Запуск перерегистрации (главный админ)\n"
+        "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
+        "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
+        "/listadmins - Показать текущих администраторов\n"
+        "/addadmin [ID] - Добавить администратора (главный админ)\n"
+        "/removeadmin [ID] - Удалить администратора (главный админ)\n"
+    )
+    await update.message.reply_text(admin_commands)
+
 async def help_command(update: Update, context: CallbackContext) -> None:
     """Показ списка доступных команд"""
     user_id = update.message.from_user.id
-    
-    # Проверяем, является ли пользователь администратором
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM admins WHERE user_id = ?", (user_id,))
-        is_admin = cursor.fetchone() is not None
+
+    is_admin = is_admin_user(user_id)
 
     basic_commands = (
         "📋 Доступные команды:\n\n"
@@ -565,8 +858,12 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "\n👑 Команды администратора:\n"
         "/viewapartments - Просмотр списка квартир\n"
         "/forceregistration - Запуск перерегистрации (главный админ)\n"
+        "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
+        "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
+        "/listadmins - Показать текущих администраторов\n"
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
         "/removeadmin [ID] - Удалить администратора (главный админ)\n"
+        "/adminhelp - Подсказка по админским командам\n"
     )
 
     message = basic_commands + (admin_commands if is_admin else "")
@@ -635,6 +932,10 @@ def main() -> None:
     application.add_handler(CommandHandler("viewapartments", view_apartments))
     application.add_handler(CommandHandler("addadmin", add_admin))
     application.add_handler(CommandHandler("removeadmin", remove_admin))
+    application.add_handler(CommandHandler("listadmins", list_admins))
+    application.add_handler(CommandHandler("adminhelp", admin_help))
+    application.add_handler(CommandHandler("adminassign", admin_assign))
+    application.add_handler(CommandHandler("adminunlink", admin_unlink))
     application.add_handler(CommandHandler("forceregistration", force_registration))
     application.add_handler(CommandHandler("approve", approve_request))
     application.add_handler(CommandHandler("reject", reject_request))
