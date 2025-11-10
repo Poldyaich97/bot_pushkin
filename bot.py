@@ -1,10 +1,19 @@
 import os
 import logging
 import sqlite3
-from datetime import datetime
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
-from telegram import Update, ChatPermissions
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    CallbackContext,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -20,6 +29,18 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID'))
 GROUP_ID = int(os.getenv('GROUP_ID'))
+FORCE_REGISTRATION_CODE = "2512"
+BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Moscow')
+
+try:
+    BOT_TZINFO = ZoneInfo(BOT_TIMEZONE)
+except Exception as tz_error:  # noqa: F841
+    BOT_TZINFO = datetime.now().astimezone().tzinfo
+    logger.warning(
+        "Unable to load timezone '%s', fallback to system tz %s",
+        BOT_TIMEZONE,
+        BOT_TZINFO,
+    )
 
 # Диапазоны квартир
 HOUSE1_START = 1
@@ -67,6 +88,23 @@ def is_valid_apartment(apartment_number: int) -> bool:
     """Проверка валидности номера квартиры"""
     return (HOUSE1_START <= apartment_number <= HOUSE1_END) or \
            (HOUSE2_START <= apartment_number <= HOUSE2_END)
+
+
+def clear_pending_requests_from_db() -> int:
+    """Удаляет все ожидающие запросы на подтверждение и возвращает их количество."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM approval_requests WHERE status = 'pending'")
+        deleted = cursor.rowcount or 0
+        conn.commit()
+    return deleted
+
+
+def get_admin_actions_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура с быстрыми действиями администратора."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 Очистить заявки", callback_data="admin_clear_requests")]
+    ])
 
 def create_db():
     """Создание базы данных"""
@@ -394,6 +432,12 @@ async def force_registration(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text("Эта команда доступна только главному администратору.")
         return
 
+    if not context.args or context.args[0] != FORCE_REGISTRATION_CODE:
+        await update.message.reply_text(
+            "Для запуска перерегистрации укажите секретный код: /forceregistration 2512"
+        )
+        return
+
     # Очищаем базу данных
     with get_db_connection() as conn:
         cursor = conn.cursor()
@@ -616,6 +660,20 @@ async def admin_delete_apartment(update: Update, context: CallbackContext) -> No
         logger.warning(f"Failed to notify group about apartment delete: {error}")
 
 
+async def clear_approval_requests(update: Update, context: CallbackContext) -> None:
+    """Очистка всех ожидающих запросов на подтверждение квартир."""
+    actor_id = update.message.from_user.id
+    if not is_admin_user(actor_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    deleted = clear_pending_requests_from_db()
+    if deleted == 0:
+        await update.message.reply_text("Нет заявок в ожидании. Очищать нечего.")
+    else:
+        await update.message.reply_text(f"🧹 Удалено запросов: {deleted}. Очередь очищена.")
+
+
 async def apartment_stats(update: Update, context: CallbackContext) -> None:
     """Вывод количества занятых и свободных квартир."""
     actor_id = update.message.from_user.id
@@ -652,6 +710,50 @@ async def apartment_stats(update: Update, context: CallbackContext) -> None:
         lines.append(f"⚠️ Есть {other_occupied} записей вне указанных диапазонов квартир.")
 
     await update.message.reply_text("\n".join(lines))
+
+
+async def handle_admin_callback(update: Update, context: CallbackContext) -> None:
+    """Обработка нажатий админских кнопок."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    data = query.data
+    actor_id = query.from_user.id
+
+    if data == "admin_clear_requests":
+        if not is_admin_user(actor_id):
+            await query.answer("Недостаточно прав.", show_alert=True)
+            return
+
+        deleted = clear_pending_requests_from_db()
+        await query.answer("Очередь очищена" if deleted else "Нет заявок")
+
+        if deleted == 0:
+            await query.message.reply_text("Нет заявок в ожидании. Очередь уже пуста.")
+        else:
+            await query.message.reply_text(f"🧹 Удалено запросов: {deleted}. Очередь очищена.")
+
+async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневное утреннее сообщение для всех жителей."""
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="Доброе утро, соседи.\nВсем хорошего дня"
+        )
+    except Exception as error:
+        logger.error(f"Failed to send morning greeting: {error}")
+
+
+async def send_evening_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневное вечернее сообщение для всех жителей."""
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="Доброй ночи, соседи."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send evening greeting: {error}")
 
 
 async def admin_assign(update: Update, context: CallbackContext) -> None:
@@ -943,12 +1045,17 @@ async def admin_help(update: Update, context: CallbackContext) -> None:
         "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
         "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
         "/admindelete [квартира] - Освободить квартиру\n"
+        "/clearrequests - Очистить зависшие заявки\n"
         "/apartmentstats - Показать занятые/свободные квартиры\n"
         "/listadmins - Показать текущих администраторов\n"
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
         "/removeadmin [ID] - Удалить администратора (главный админ)\n"
     )
     await update.message.reply_text(admin_commands)
+    await update.message.reply_text(
+        "Быстрые действия администратора:",
+        reply_markup=get_admin_actions_keyboard()
+    )
 
 async def help_command(update: Update, context: CallbackContext) -> None:
     """Показ списка доступных команд"""
@@ -971,6 +1078,7 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
         "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
         "/admindelete [квартира] - Освободить квартиру\n"
+        "/clearrequests - Очистить зависшие заявки\n"
         "/apartmentstats - Показать занятые/свободные квартиры\n"
         "/listadmins - Показать текущих администраторов\n"
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
@@ -1049,6 +1157,7 @@ def main() -> None:
     application.add_handler(CommandHandler("adminassign", admin_assign))
     application.add_handler(CommandHandler("adminunlink", admin_unlink))
     application.add_handler(CommandHandler("admindelete", admin_delete_apartment))
+    application.add_handler(CommandHandler("clearrequests", clear_approval_requests))
     application.add_handler(CommandHandler("apartmentstats", apartment_stats))
     application.add_handler(CommandHandler("forceregistration", force_registration))
     application.add_handler(CommandHandler("approve", approve_request))
@@ -1057,6 +1166,14 @@ def main() -> None:
     
     # Обработчик текстовых сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern="^admin_"))
+
+    # Планировщик рассылок
+    if application.job_queue:
+        morning_time = time(hour=7, minute=0, tzinfo=BOT_TZINFO)
+        evening_time = time(hour=22, minute=0, tzinfo=BOT_TZINFO)
+        application.job_queue.run_daily(send_morning_greeting, morning_time, name="morning_greeting")
+        application.job_queue.run_daily(send_evening_greeting, evening_time, name="evening_greeting")
     
     # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
