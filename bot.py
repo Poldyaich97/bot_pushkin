@@ -2,7 +2,10 @@ import os
 import logging
 import sqlite3
 from datetime import datetime, time
-from zoneinfo import ZoneInfo
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 from dotenv import load_dotenv
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
