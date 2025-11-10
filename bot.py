@@ -69,7 +69,8 @@ def sanitize_markdown(text: str) -> str:
 def format_user_mention(user) -> str:
     """Формирование безопасного упоминания пользователя."""
     if user.username:
-        return f"@{user.username}"
+        safe_username = user.username.replace('_', '\\_')
+        return f"@{safe_username}"
     display_name = sanitize_markdown(user.first_name or "пользователь")
     if not display_name:
         display_name = "пользователь"
@@ -1121,7 +1122,7 @@ async def check_all_members(update: Update, context: CallbackContext) -> None:
                     
                     if not apartment:
                         unregistered_count += 1
-                        user_mention = f"@{member.user.username}" if member.user.username else f"[{member.user.first_name}](tg://user?id={user_id})"
+                        user_mention = format_user_mention(member.user)
                         await context.bot.send_message(
                             chat_id=GROUP_ID,
                             text=f"⚠️ {user_mention}, пожалуйста, укажите номер своей квартиры с помощью команды:\n"
