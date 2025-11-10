@@ -546,6 +546,114 @@ async def admin_unlink(update: Update, context: CallbackContext) -> None:
         logger.warning(f"Failed to notify group about admin unlink: {error}")
 
 
+async def admin_delete_apartment(update: Update, context: CallbackContext) -> None:
+    """Удаление записи о квартире по номеру."""
+    actor_id = update.message.from_user.id
+    if not is_admin_user(actor_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(
+            "Использование: /admindelete [номер_квартиры]\n"
+            "Команда полностью освобождает квартиру для самостоятельной регистрации."
+        )
+        return
+
+    apartment_number = int(context.args[0])
+    if not is_valid_apartment(apartment_number):
+        await update.message.reply_text(
+            "Неверный номер квартиры.\n"
+            f"Дом 1: квартиры {HOUSE1_START}-{HOUSE1_END}\n"
+            f"Дом 2: квартиры от {HOUSE2_START}"
+        )
+        return
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT user_id FROM apartments WHERE apartment_number = ?",
+            (apartment_number,)
+        )
+        residents = [row[0] for row in cursor.fetchall()]
+
+        if not residents:
+            await update.message.reply_text(
+                f"Для квартиры {apartment_number} нет записей. Она уже свободна."
+            )
+            return
+
+        cursor.execute(
+            "DELETE FROM apartments WHERE apartment_number = ?",
+            (apartment_number,)
+        )
+        conn.commit()
+
+    resident_mentions = []
+    for resident_id in residents:
+        try:
+            member = await context.bot.get_chat_member(GROUP_ID, resident_id)
+            resident_mentions.append(format_user_mention(member.user))
+        except Exception as error:
+            logger.warning(f"Failed to load resident {resident_id} for admindelete: {error}")
+            resident_mentions.append(f"ID: {resident_id}")
+
+    removed_info = ", ".join(resident_mentions)
+    await update.message.reply_text(
+        f"Запись о квартире {apartment_number} удалена. Удалены жильцы: {removed_info}",
+        parse_mode='Markdown'
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text=(
+                f"🧹 Администратор освободил квартиру {apartment_number}. "
+                "Теперь любой житель может привязать её через /setapartment."
+            )
+        )
+    except Exception as error:
+        logger.warning(f"Failed to notify group about apartment delete: {error}")
+
+
+async def apartment_stats(update: Update, context: CallbackContext) -> None:
+    """Вывод количества занятых и свободных квартир."""
+    actor_id = update.message.from_user.id
+    if not is_admin_user(actor_id):
+        await update.message.reply_text("Эта команда доступна только администраторам.")
+        return
+
+    total_house1 = HOUSE1_END - HOUSE1_START + 1
+    total_house2 = HOUSE2_END - HOUSE2_START + 1
+    total_all = total_house1 + total_house2
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT apartment_number FROM apartments")
+        occupied_numbers = [row[0] for row in cursor.fetchall()]
+
+    occupied_house1 = sum(1 for number in occupied_numbers if HOUSE1_START <= number <= HOUSE1_END)
+    occupied_house2 = sum(1 for number in occupied_numbers if HOUSE2_START <= number <= HOUSE2_END)
+    occupied_all = occupied_house1 + occupied_house2
+    other_occupied = len(occupied_numbers) - occupied_all
+
+    free_house1 = max(total_house1 - occupied_house1, 0)
+    free_house2 = max(total_house2 - occupied_house2, 0)
+    free_all = max(total_all - occupied_all, 0)
+
+    lines = [
+        "📊 Статистика квартир:",
+        f"Дом 1: занято {occupied_house1}/{total_house1}, свободно {free_house1}",
+        f"Дом 2: занято {occupied_house2}/{total_house2}, свободно {free_house2}",
+        f"Всего: занято {occupied_all}/{total_all}, свободно {free_all}",
+    ]
+
+    if other_occupied > 0:
+        lines.append(f"⚠️ Есть {other_occupied} записей вне указанных диапазонов квартир.")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def admin_assign(update: Update, context: CallbackContext) -> None:
     """Переназначение квартиры на указанного пользователя."""
     actor_id = update.message.from_user.id
@@ -834,6 +942,8 @@ async def admin_help(update: Update, context: CallbackContext) -> None:
         "/forceregistration - Запуск перерегистрации (главный админ)\n"
         "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
         "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
+        "/admindelete [квартира] - Освободить квартиру\n"
+        "/apartmentstats - Показать занятые/свободные квартиры\n"
         "/listadmins - Показать текущих администраторов\n"
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
         "/removeadmin [ID] - Удалить администратора (главный админ)\n"
@@ -860,6 +970,8 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "/forceregistration - Запуск перерегистрации (главный админ)\n"
         "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
         "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
+        "/admindelete [квартира] - Освободить квартиру\n"
+        "/apartmentstats - Показать занятые/свободные квартиры\n"
         "/listadmins - Показать текущих администраторов\n"
         "/addadmin [ID] - Добавить администратора (главный админ)\n"
         "/removeadmin [ID] - Удалить администратора (главный админ)\n"
@@ -936,6 +1048,8 @@ def main() -> None:
     application.add_handler(CommandHandler("adminhelp", admin_help))
     application.add_handler(CommandHandler("adminassign", admin_assign))
     application.add_handler(CommandHandler("adminunlink", admin_unlink))
+    application.add_handler(CommandHandler("admindelete", admin_delete_apartment))
+    application.add_handler(CommandHandler("apartmentstats", apartment_stats))
     application.add_handler(CommandHandler("forceregistration", force_registration))
     application.add_handler(CommandHandler("approve", approve_request))
     application.add_handler(CommandHandler("reject", reject_request))
