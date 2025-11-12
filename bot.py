@@ -35,6 +35,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 MAIN_ADMIN_ID = int(os.getenv('MAIN_ADMIN_ID'))
 GROUP_ID = int(os.getenv('GROUP_ID'))
 FORCE_REGISTRATION_CODE = "2512"
+CLEANUP_TIMEZONE = os.getenv('CLEANUP_TIMEZONE', 'Asia/Yekaterinburg')
 BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Moscow')
 USER_LINK_RE = re.compile(r'tg://user\?id=(\d+)', re.IGNORECASE)
 
@@ -46,6 +47,16 @@ except Exception as tz_error:  # noqa: F841
         "Unable to load timezone '%s', fallback to system tz %s",
         BOT_TIMEZONE,
         BOT_TZINFO,
+    )
+
+try:
+    CLEANUP_TZINFO = ZoneInfo(CLEANUP_TIMEZONE)
+except Exception as cleanup_tz_error:  # noqa: F841
+    CLEANUP_TZINFO = BOT_TZINFO
+    logger.warning(
+        "Unable to load cleanup timezone '%s', fallback to bot tz %s",
+        CLEANUP_TIMEZONE,
+        CLEANUP_TZINFO,
     )
 
 # Диапазоны квартир
@@ -95,6 +106,37 @@ def is_valid_apartment(apartment_number: int) -> bool:
     """Проверка валидности номера квартиры"""
     return (HOUSE1_START <= apartment_number <= HOUSE1_END) or \
            (HOUSE2_START <= apartment_number <= HOUSE2_END)
+
+
+ADMIN_COMMANDS_LIST = [
+    "/viewapartments - Просмотр списка квартир",
+    "/adminassign [квартира] [ID] - Назначить владельца квартиры",
+    "/adminunlink [ID] [квартира] - Удалить привязку пользователя",
+    "/admindelete [квартира] - Освободить квартиру",
+    "/clearrequests - Очистить зависшие заявки",
+    "/apartmentstats - Показать занятые/свободные квартиры",
+    "/listadmins - Показать текущих администраторов",
+    "/adminhelp - Подсказка по админским командам",
+]
+
+MAIN_ADMIN_COMMANDS_LIST = [
+    "/forceregistration - Запуск перерегистрации",
+    "/addadmin [ID] - Добавить администратора",
+    "/removeadmin [ID] - Удалить администратора",
+    "/checkall - Проверить регистрацию всех участников",
+]
+
+
+def build_admin_menu_text(include_main_admin: bool) -> str:
+    """Возвращает текст подсказки по админским командам."""
+    lines = ["👑 Команды администратора:", *ADMIN_COMMANDS_LIST]
+    if include_main_admin:
+        lines.append("")
+        lines.append("⭐ Команды главного администратора:")
+        lines.extend(MAIN_ADMIN_COMMANDS_LIST)
+    lines.append("")
+    lines.append("Поддерживаются ID, @username и ссылки tg://user?id=...")
+    return "\n".join(lines)
 
 
 def upsert_user_profile(user) -> None:
@@ -869,6 +911,20 @@ async def handle_admin_callback(update: Update, context: CallbackContext) -> Non
         else:
             await query.message.reply_text(f"🧹 Удалено запросов: {deleted}. Очередь очищена.")
 
+
+async def auto_cleanup_pending_requests(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Ежедневная автоочистка зависших заявок."""
+    try:
+        deleted = clear_pending_requests_from_db()
+        if deleted > 0:
+            await context.bot.send_message(
+                chat_id=GROUP_ID,
+                text=f"🧹 Автоматическая очистка заявок: удалено {deleted} запросов."
+            )
+        logger.info("Auto cleanup completed. Deleted requests: %s", deleted)
+    except Exception as error:
+        logger.error(f"Failed to auto-clean approval requests: {error}")
+
 async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ежедневное утреннее сообщение для всех жителей."""
     try:
@@ -1190,25 +1246,13 @@ async def list_admins(update: Update, context: CallbackContext) -> None:
 async def admin_help(update: Update, context: CallbackContext) -> None:
     """Подсказка по админским командам."""
     remember_user(update.message.from_user)
-    if not is_admin_user(update.message.from_user.id):
+    user_id = update.message.from_user.id
+    if not is_admin_user(user_id):
         await update.message.reply_text("Эта команда доступна только администраторам.")
         return
 
-    admin_commands = (
-        "👑 Команды администратора:\n"
-        "/viewapartments - Просмотр списка квартир\n"
-        "/forceregistration - Запуск перерегистрации (главный админ)\n"
-        "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
-        "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
-        "/admindelete [квартира] - Освободить квартиру\n"
-        "/clearrequests - Очистить зависшие заявки\n"
-        "/apartmentstats - Показать занятые/свободные квартиры\n"
-        "/listadmins - Показать текущих администраторов\n"
-        "/addadmin [ID] - Добавить администратора (главный админ)\n"
-        "/removeadmin [ID] - Удалить администратора (главный админ)\n"
-        "\nВместо ID можно указывать @username или ссылку tg://user?id=..."
-    )
-    await update.message.reply_text(admin_commands)
+    admin_text = build_admin_menu_text(user_id == MAIN_ADMIN_ID)
+    await update.message.reply_text(admin_text)
     await update.message.reply_text(
         "Быстрые действия администратора:",
         reply_markup=get_admin_actions_keyboard()
@@ -1229,23 +1273,10 @@ async def help_command(update: Update, context: CallbackContext) -> None:
         "/deleteapartment - Удалить привязку к квартире\n"
     )
 
-    admin_commands = (
-        "\n👑 Команды администратора:\n"
-        "/viewapartments - Просмотр списка квартир\n"
-        "/forceregistration - Запуск перерегистрации (главный админ)\n"
-        "/adminassign [квартира] [ID] - Назначить владельца квартиры\n"
-        "/adminunlink [ID] [квартира] - Удалить привязку пользователя\n"
-        "/admindelete [квартира] - Освободить квартиру\n"
-        "/clearrequests - Очистить зависшие заявки\n"
-        "/apartmentstats - Показать занятые/свободные квартиры\n"
-        "/listadmins - Показать текущих администраторов\n"
-        "/addadmin [ID] - Добавить администратора (главный админ)\n"
-        "/removeadmin [ID] - Удалить администратора (главный админ)\n"
-        "/adminhelp - Подсказка по админским командам\n"
-        "Поддерживаются ID, @username и ссылки tg://user?id=..."
-    )
-
-    message = basic_commands + (admin_commands if is_admin else "")
+    message = basic_commands
+    if is_admin:
+        admin_section = build_admin_menu_text(user_id == MAIN_ADMIN_ID)
+        message = f"{message}\n\n{admin_section}"
     await update.message.reply_text(message)
 
 async def check_all_members(update: Update, context: CallbackContext) -> None:
@@ -1332,8 +1363,14 @@ def main() -> None:
     if application.job_queue:
         morning_time = time(hour=7, minute=0, tzinfo=BOT_TZINFO)
         evening_time = time(hour=22, minute=0, tzinfo=BOT_TZINFO)
+        cleanup_time = time(hour=4, minute=0, tzinfo=CLEANUP_TZINFO)
         application.job_queue.run_daily(send_morning_greeting, morning_time, name="morning_greeting")
         application.job_queue.run_daily(send_evening_greeting, evening_time, name="evening_greeting")
+        application.job_queue.run_daily(
+            auto_cleanup_pending_requests,
+            cleanup_time,
+            name="auto_cleanup_requests"
+        )
     
     # Запуск бота
     application.run_polling(allowed_updates=Update.ALL_TYPES)
