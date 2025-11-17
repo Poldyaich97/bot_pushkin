@@ -2,8 +2,8 @@ import os
 import logging
 import sqlite3
 import re
-from datetime import datetime, time
-from typing import Optional
+from datetime import datetime, time, timedelta, date
+from typing import Optional, Set
 try:
     from zoneinfo import ZoneInfo
 except ImportError:
@@ -38,6 +38,7 @@ FORCE_REGISTRATION_CODE = "2512"
 CLEANUP_TIMEZONE = os.getenv('CLEANUP_TIMEZONE', 'Asia/Yekaterinburg')
 BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Moscow')
 USER_LINK_RE = re.compile(r'tg://user\?id=(\d+)', re.IGNORECASE)
+HOLIDAYS_RAW = os.getenv('HOLIDAYS', '')
 
 try:
     BOT_TZINFO = ZoneInfo(BOT_TIMEZONE)
@@ -58,6 +59,23 @@ except Exception as cleanup_tz_error:  # noqa: F841
         CLEANUP_TIMEZONE,
         CLEANUP_TZINFO,
     )
+
+
+def parse_holiday_dates(value: str) -> Set[str]:
+    """Разбирает строку вида 'YYYY-MM-DD,YYYY-MM-DD' в множество дат."""
+    result: Set[str] = set()
+    for raw in value.split(','):
+        cleaned = raw.strip()
+        if not cleaned:
+            continue
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+            result.add(cleaned)
+        else:
+            logger.warning("Skip invalid holiday date: %s", cleaned)
+    return result
+
+
+HOLIDAY_DATES = parse_holiday_dates(HOLIDAYS_RAW)
 
 # Диапазоны квартир
 HOUSE1_START = 1
@@ -106,6 +124,23 @@ def is_valid_apartment(apartment_number: int) -> bool:
     """Проверка валидности номера квартиры"""
     return (HOUSE1_START <= apartment_number <= HOUSE1_END) or \
            (HOUSE2_START <= apartment_number <= HOUSE2_END)
+
+
+def is_holiday(day: date) -> bool:
+    """Проверка, что день является праздничным."""
+    return day.isoformat() in HOLIDAY_DATES
+
+
+def is_long_quiet_day(day: date) -> bool:
+    """
+    Длинный ночной режим (с 18:00 до 11:00) действует в пятницу-воскресенье или в праздничные дни.
+    """
+    return day.weekday() >= 4 or is_holiday(day)
+
+
+def get_bot_today() -> date:
+    """Текущая дата в часовой зоне бота."""
+    return datetime.now(BOT_TZINFO).date()
 
 
 ADMIN_COMMANDS_LIST = [
@@ -925,6 +960,87 @@ async def auto_cleanup_pending_requests(context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception as error:
         logger.error(f"Failed to auto-clean approval requests: {error}")
 
+
+async def send_weekday_night_quiet_start(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Напоминание о ночной тишине в будни (23:00–08:00)."""
+    today = get_bot_today()
+    if is_long_quiet_day(today):
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="🔕 Ночное время тишины с 23:00 до 08:00. Просьба не шуметь."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send weekday night quiet start: {error}")
+
+
+async def send_weekday_night_quiet_end(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Уведомление о завершении ночной тишины в будни (08:00)."""
+    today = get_bot_today()
+    yesterday = today - timedelta(days=1)
+    if is_long_quiet_day(yesterday):
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="🔔 Ночное время тишины завершилось, можно шуметь."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send weekday night quiet end: {error}")
+
+
+async def send_long_night_quiet_start(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Напоминание о длинной ночной тишине (пт-вс и праздники, 18:00–11:00)."""
+    today = get_bot_today()
+    if not is_long_quiet_day(today):
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="🔕 Ночное время тишины (выходные/праздники) с 18:00 до 11:00. Просьба не шуметь."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send long night quiet start: {error}")
+
+
+async def send_long_night_quiet_end(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Уведомление о завершении длинной ночной тишины (11:00)."""
+    today = get_bot_today()
+    yesterday = today - timedelta(days=1)
+    if not is_long_quiet_day(yesterday):
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="🔔 Ночное время тишины завершилось, можно шуметь."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send long night quiet end: {error}")
+
+
+async def send_day_quiet_start(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Напоминание о дневном тихом часе (13:00–15:00)."""
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="🔕 Дневной тихий час с 13:00 до 15:00. Просьба не шуметь."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send day quiet start: {error}")
+
+
+async def send_day_quiet_end(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Уведомление о завершении дневного тихого часа (15:00)."""
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_ID,
+            text="🔔 Дневной тихий час завершился, можно шуметь."
+        )
+    except Exception as error:
+        logger.error(f"Failed to send day quiet end: {error}")
+
+
 async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Ежедневное утреннее сообщение для всех жителей."""
     try:
@@ -1364,12 +1480,49 @@ def main() -> None:
         morning_time = time(hour=7, minute=0, tzinfo=BOT_TZINFO)
         evening_time = time(hour=22, minute=0, tzinfo=BOT_TZINFO)
         cleanup_time = time(hour=4, minute=0, tzinfo=CLEANUP_TZINFO)
+        weekday_night_start_time = time(hour=23, minute=0, tzinfo=BOT_TZINFO)
+        weekday_night_end_time = time(hour=8, minute=0, tzinfo=BOT_TZINFO)
+        long_night_start_time = time(hour=18, minute=0, tzinfo=BOT_TZINFO)
+        long_night_end_time = time(hour=11, minute=0, tzinfo=BOT_TZINFO)
+        day_quiet_start_time = time(hour=13, minute=0, tzinfo=BOT_TZINFO)
+        day_quiet_end_time = time(hour=15, minute=0, tzinfo=BOT_TZINFO)
+
         application.job_queue.run_daily(send_morning_greeting, morning_time, name="morning_greeting")
         application.job_queue.run_daily(send_evening_greeting, evening_time, name="evening_greeting")
         application.job_queue.run_daily(
             auto_cleanup_pending_requests,
             cleanup_time,
             name="auto_cleanup_requests"
+        )
+        application.job_queue.run_daily(
+            send_weekday_night_quiet_start,
+            weekday_night_start_time,
+            name="weekday_night_quiet_start",
+        )
+        application.job_queue.run_daily(
+            send_weekday_night_quiet_end,
+            weekday_night_end_time,
+            name="weekday_night_quiet_end",
+        )
+        application.job_queue.run_daily(
+            send_long_night_quiet_start,
+            long_night_start_time,
+            name="long_night_quiet_start",
+        )
+        application.job_queue.run_daily(
+            send_long_night_quiet_end,
+            long_night_end_time,
+            name="long_night_quiet_end",
+        )
+        application.job_queue.run_daily(
+            send_day_quiet_start,
+            day_quiet_start_time,
+            name="day_quiet_start",
+        )
+        application.job_queue.run_daily(
+            send_day_quiet_end,
+            day_quiet_end_time,
+            name="day_quiet_end",
         )
     
     # Запуск бота
